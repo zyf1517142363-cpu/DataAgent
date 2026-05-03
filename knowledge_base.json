@@ -1,0 +1,17 @@
+[
+  {
+    "term": "寄了",
+    "meaning": "数据或效果失败",
+    "sentiment": "negative"
+  },
+  {
+    "term": "硬核",
+    "meaning": "技术深度高，专业性强",
+    "sentiment": "positive"
+  },
+  {
+    "term": "完播率",
+    "meaning": "观众看完视频的比例",
+    "sentiment": "neutral"
+  }
+]

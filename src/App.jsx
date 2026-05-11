@@ -19,7 +19,7 @@ function trimSlash(value) {
   return String(value || "").replace(/\/+$/, "");
 }
 
-const DEFAULT_VIDEO_URL = "https://www.bilibili.com/video/game-content-demo";
+const DEFAULT_VIDEO_URL = "";
 const DEFAULT_UPLOAD_STATE = "等待CSV";
 const DEFAULT_REPORT = "报告将在点击“开始内容分析”后展示。";
 const DEFAULT_WELCOME = "你好，我是你的 B 站游戏区 AI 分析助手。你可以上传 CSV 数据、输入视频链接，然后询问选题、标题、封面、留存、弹幕互动和发布时间策略。";
@@ -30,6 +30,7 @@ function blankSnapshot() {
     uploadState: DEFAULT_UPLOAD_STATE,
     csvStats: null,
     videoMeta: null,
+    videoError: "",
     report: DEFAULT_REPORT,
     analysisData: {},
     messages: [{ role: "assistant", content: DEFAULT_WELCOME }],
@@ -63,6 +64,7 @@ function App() {
   const [uploadState, setUploadState] = useState(DEFAULT_UPLOAD_STATE);
   const [csvStats, setCsvStats] = useState(null);
   const [videoMeta, setVideoMeta] = useState(null);
+  const [videoError, setVideoError] = useState("");
   const [report, setReport] = useState(DEFAULT_REPORT);
   const [analysisData, setAnalysisData] = useState({});
   const [projects, setProjects] = useState(() => [
@@ -91,6 +93,10 @@ function App() {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, loading.chat]);
 
+  useEffect(() => {
+    setVideoError("");
+  }, [videoUrl]);
+
   const causalFactors = useMemo(() => {
     const strategy = analysisData?.strategy?.causal_factors;
     const analysis = analysisData?.analysis?.causal_factors;
@@ -99,13 +105,19 @@ function App() {
 
   const semanticTags = useMemo(() => safeList(analysisData?.knowledge?.semantic_tags), [analysisData]);
 
-  async function apiJson(path, options = {}) {
+  async function apiJson(path, options = {}, requestTimeoutMs = 22000) {
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 22000);
+    const timer = window.setTimeout(() => controller.abort(), requestTimeoutMs);
     try {
       const res = await fetch(`${API_BASE}${path}`, { ...options, signal: controller.signal });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.message || `HTTP ${res.status}`);
+      if (!res.ok) {
+        let msg = data?.message || `HTTP ${res.status}`;
+        const detail = data?.detail;
+        if (typeof detail === "string") msg = detail;
+        else if (Array.isArray(detail)) msg = detail.map((x) => (typeof x === "object" && x?.msg ? x.msg : String(x))).join("；");
+        throw new Error(msg);
+      }
       return data;
     } finally {
       window.clearTimeout(timer);
@@ -129,7 +141,12 @@ function App() {
       lines.push(`- 场景：${videoMeta.scenario_type || "GAME"}`);
       if (Array.isArray(videoMeta.tags) && videoMeta.tags.length) lines.push(`- 标签：${videoMeta.tags.join("、")}`);
       if (videoMeta.url) lines.push(`- 链接：${videoMeta.url}`);
-      if (videoMeta.mock_subtitle) lines.push(`- 字幕摘要：${String(videoMeta.mock_subtitle).slice(0, 400)}`);
+      if (videoMeta.source === "bilibili_api") lines.push("- 视频数据：已通过 B 站公开接口抓取元数据与字幕/简介。");
+      if (videoMeta.bilibili_stat) {
+        const s = videoMeta.bilibili_stat;
+        lines.push(`- B站统计：播放 ${s.view ?? "—"}，点赞 ${s.like ?? "—"}，评论 ${s.reply ?? "—"}，弹幕 ${s.danmaku ?? "—"}`);
+      }
+      if (videoMeta.mock_subtitle) lines.push(`- 字幕/简介（节选）：\n${String(videoMeta.mock_subtitle).slice(0, 4500)}`);
     } else {
       lines.push("【当前视频】尚未载入。");
     }
@@ -236,12 +253,24 @@ function App() {
   }
 
   async function submitVideo() {
+    if (!String(videoUrl || "").trim()) {
+      setVideoError("请输入含 BV 号的 B 站视频页链接。");
+      setVideoMeta(null);
+      return null;
+    }
     setLoading((s) => ({ ...s, video: true }));
+    setVideoError("");
     try {
-      const data = await apiJson("/video", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, url: videoUrl, scenario: "A" }) });
-      if (data) setVideoMeta(data);
-    } catch {
-      setVideoMeta({ title: "B站游戏区视频Mock已启用", tags: ["游戏区", "攻略", "留存", "弹幕"], scenario_type: "GAME", mock_subtitle: "前端兜底演示文案。" });
+      const data = await apiJson("/video", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId, url: videoUrl }) }, 60000);
+      if (data) {
+        setVideoMeta(data);
+        return data;
+      }
+      return null;
+    } catch (err) {
+      setVideoMeta(null);
+      setVideoError(err?.message || "载入视频失败，请检查链接是否为有效 BV 页、网络与后端服务。");
+      return null;
     } finally {
       setLoading((s) => ({ ...s, video: false }));
     }
@@ -251,12 +280,18 @@ function App() {
     setLoading((s) => ({ ...s, analyze: true }));
     setReport("Agent 并发调度中：DataAgent 与 VideoAnalysisAgent 正在并行运行...");
     try {
-      if (!videoMeta) await submitVideo();
-      const data = await apiJson("/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId }) });
+      let meta = videoMeta;
+      if (!meta) meta = await submitVideo();
+      if (!meta) {
+        setReport("请先成功载入视频：请使用包含 BV 号的 B 站视频页链接，并查看左侧红色错误提示。");
+        return;
+      }
+      const data = await apiJson("/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_id: sessionId }) }, 130000);
       if (data) {
         setReport(data.report || "报告生成完成，但内容为空。");
         setAnalysisData(data.data || {});
-        setMessages((items) => [...items, { role: "assistant", content: "游戏区内容分析报告已生成。你可以继续追问标题、封面、开头留存、弹幕互动或发布时间。" }]);
+        const llmNote = data.report_llm ? " 报告正文由服务端大模型（ANALYSIS_LLM_* 环境变量）基于真实字幕/简介生成。" : "";
+        setMessages((items) => [...items, { role: "assistant", content: `游戏区内容分析报告已生成。${llmNote}你可以继续追问标题、封面、开头留存、弹幕互动或发布时间。` }]);
       }
     } catch (err) {
       setReport(`系统触发展示兜底：${err.message || "分析失败"}。请确认后端已启动。`);
@@ -308,6 +343,7 @@ function App() {
     const next = newSessionId();
     setSessionId(next);
     setVideoMeta(null);
+    setVideoError("");
     setCsvStats(null);
     setAnalysisData({});
     setReport("已创建新会话，请重新上传数据或输入视频链接。");
@@ -322,7 +358,7 @@ function App() {
   }
 
   function captureSnapshot() {
-    return { videoUrl, uploadState, csvStats, videoMeta, report, analysisData, messages };
+    return { videoUrl, uploadState, csvStats, videoMeta, videoError, report, analysisData, messages };
   }
 
   function applySnapshot(snap) {
@@ -330,6 +366,7 @@ function App() {
     setUploadState(snap.uploadState ?? DEFAULT_UPLOAD_STATE);
     setCsvStats(snap.csvStats ?? null);
     setVideoMeta(snap.videoMeta ?? null);
+    setVideoError(snap.videoError ?? "");
     setReport(snap.report ?? DEFAULT_REPORT);
     setAnalysisData(snap.analysisData ?? {});
     setMessages(Array.isArray(snap.messages) && snap.messages.length ? snap.messages : [{ role: "assistant", content: DEFAULT_WELCOME }]);
@@ -369,7 +406,7 @@ function App() {
   return (
     <main className="min-h-screen bg-[#F8FAFC] p-6 font-sans text-slate-600">
       <div className="mx-auto flex h-[calc(100vh-48px)] max-w-[1480px] gap-5">
-        <LeftSidebar uploadState={uploadState} videoMeta={videoMeta} videoUrl={videoUrl} loading={loading} fileInputRef={fileInputRef} projects={projects} onVideoUrlChange={setVideoUrl} onUploadCsv={uploadCsv} onTriggerFilePicker={triggerFilePicker} onLoadSampleCsv={loadSampleCsv} onSubmitVideo={submitVideo} onAnalyze={analyze} onResetSession={resetSession} onAddProject={addProject} onSelectProject={selectProject} />
+        <LeftSidebar uploadState={uploadState} videoMeta={videoMeta} videoUrl={videoUrl} videoError={videoError} loading={loading} fileInputRef={fileInputRef} projects={projects} onVideoUrlChange={setVideoUrl} onUploadCsv={uploadCsv} onTriggerFilePicker={triggerFilePicker} onLoadSampleCsv={loadSampleCsv} onSubmitVideo={submitVideo} onAnalyze={analyze} onResetSession={resetSession} onAddProject={addProject} onSelectProject={selectProject} />
         <ChatCenter llmConfig={llmConfig} llmStatus={llmStatus} loading={loading} messages={messages} question={question} messageEndRef={messageEndRef} onQuestionChange={setQuestion} onSendQuestion={sendQuestion} onConfigChange={updateLlmConfig} onTestLlm={testLlmConnection} />
         <ReportPanel tab={reportTab} data={analysisData} report={report} causalFactors={causalFactors} semanticTags={semanticTags} onTabChange={setReportTab} onDownloadReport={downloadReport} />
       </div>
@@ -377,13 +414,13 @@ function App() {
   );
 }
 
-function LeftSidebar({ uploadState, videoMeta, videoUrl, loading, fileInputRef, projects, onVideoUrlChange, onUploadCsv, onTriggerFilePicker, onLoadSampleCsv, onSubmitVideo, onAnalyze, onResetSession, onAddProject, onSelectProject }) {
+function LeftSidebar({ uploadState, videoMeta, videoUrl, videoError, loading, fileInputRef, projects, onVideoUrlChange, onUploadCsv, onTriggerFilePicker, onLoadSampleCsv, onSubmitVideo, onAnalyze, onResetSession, onAddProject, onSelectProject }) {
   return (
     <aside style={{ width: "18rem", flex: "0 0 18rem" }} className="flex h-full min-w-0 max-w-[18rem] shrink-0 grow-0 basis-72 flex-col gap-4 overflow-hidden rounded-2xl bg-white p-4 shadow-[0_8px_30px_rgb(0,0,0,0.04)]">
       <div className="flex items-center justify-between"><Brand /><button type="button" onClick={onAddProject} title="新建项目" className="rounded-xl bg-indigo-600 p-2 text-white shadow-sm transition-all duration-300 hover:-translate-y-0.5 hover:bg-indigo-500"><Plus size={16} /></button></div>
       <section><SectionHeader title="项目管理" /><div className="mt-3 space-y-2">{projects.map((project) => <button key={project.id} type="button" onClick={() => onSelectProject?.(project.id)} className={`flex w-full items-center gap-3 rounded-2xl px-3 py-3 text-left transition-all duration-300 ${project.active ? "bg-indigo-50 text-indigo-700" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"}`}><span className={`flex h-9 w-9 items-center justify-center rounded-xl ${project.active ? "bg-indigo-600 text-white" : "bg-amber-50 text-amber-500"}`}><FolderOpen size={17} /></span><span className="min-w-0"><span className="block truncate text-sm font-semibold">{project.name}</span><span className="mt-0.5 block truncate text-xs text-slate-400">{project.time}</span></span></button>)}</div></section>
       <section className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm"><SectionHeader title="数据输入" /><button type="button" onClick={onTriggerFilePicker} disabled={loading.upload} className="mt-3 flex w-full cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-indigo-200 bg-indigo-50/60 px-4 py-6 text-center transition-colors duration-300 hover:border-indigo-300 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-70">{loading.upload ? <Loader2 className="animate-spin text-indigo-600" /> : <UploadCloud className="text-indigo-600" />}<span className="mt-3 text-sm font-semibold text-slate-700">上传游戏区 CSV 数据</span><span className="mt-1 text-xs leading-5 text-slate-400">播放、点赞、评论、时长等指标</span></button><input ref={fileInputRef} className="sr-only" type="file" accept=".csv,text/csv" onChange={(event) => { const f = event.target.files?.[0]; if (f) onUploadCsv(f); else event.target.value = ""; }} /><button onClick={onLoadSampleCsv} className="mt-3 w-full rounded-xl bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-600 transition-colors duration-300 hover:bg-slate-100">导入示例 CSV</button><p className="mt-2 break-words text-xs leading-5 text-indigo-600">{uploadState}</p></section>
-      <section className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm"><SectionHeader title="视频链接" /><div className="mt-3 flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 transition-all duration-300 focus-within:border-indigo-200 focus-within:bg-white"><Link2 size={15} className="text-slate-400" /><input value={videoUrl} onChange={(event) => onVideoUrlChange(event.target.value)} className="min-w-0 flex-1 bg-transparent text-sm text-slate-600 outline-none placeholder:text-slate-400" placeholder="https://www.bilibili.com/video/..." /></div><button onClick={onSubmitVideo} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-3 py-2.5 text-sm font-semibold text-white transition-[background-color,transform,box-shadow] duration-300 hover:-translate-y-0.5 hover:bg-slate-800">{loading.video ? <Loader2 size={16} className="animate-spin" /> : <PlayCircle size={16} />}载入视频</button></section>
+      <section className="rounded-2xl border border-slate-100 bg-white p-4 shadow-sm"><SectionHeader title="视频链接" /><div className="mt-3 flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 transition-all duration-300 focus-within:border-indigo-200 focus-within:bg-white"><Link2 size={15} className="text-slate-400" /><input value={videoUrl} onChange={(event) => onVideoUrlChange(event.target.value)} className="min-w-0 flex-1 bg-transparent text-sm text-slate-600 outline-none placeholder:text-slate-400" placeholder="https://www.bilibili.com/video/..." /></div><button onClick={onSubmitVideo} className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-3 py-2.5 text-sm font-semibold text-white transition-[background-color,transform,box-shadow] duration-300 hover:-translate-y-0.5 hover:bg-slate-800">{loading.video ? <Loader2 size={16} className="animate-spin" /> : <PlayCircle size={16} />}载入视频</button>{videoError ? <p className="mt-2 break-words text-xs leading-5 text-red-600">{videoError}</p> : null}</section>
       <div className="mt-auto space-y-3"><CurrentVideoCard videoMeta={videoMeta} /><button onClick={onAnalyze} disabled={loading.analyze} className="flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-600 to-violet-600 px-4 py-3 text-sm font-semibold text-white shadow-[0_8px_30px_rgb(79,70,229,0.22)] transition-[transform,box-shadow,opacity] duration-300 hover:-translate-y-0.5 hover:shadow-[0_12px_34px_rgb(79,70,229,0.28)] disabled:cursor-not-allowed disabled:opacity-70">{loading.analyze ? <Loader2 size={18} className="animate-spin" /> : <BarChart3 size={18} />}开始分析</button><button onClick={onResetSession} className="w-full rounded-2xl border border-slate-100 bg-white px-4 py-2.5 text-sm font-semibold text-slate-600 transition-all duration-300 hover:bg-slate-50">新建会话</button></div>
     </aside>
   );
@@ -399,7 +436,7 @@ function ReportPanel({ tab, data, report, causalFactors, semanticTags, onTabChan
 
 function Brand() { return <div className="flex items-center gap-3"><span className="flex h-10 w-10 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-600 to-violet-600 text-white shadow-sm"><Sparkles size={20} /></span><span><span className="block text-sm font-semibold text-slate-800">AI自媒体分析助手</span><span className="mt-0.5 block text-xs text-slate-400">游戏区 Demo</span></span></div>; }
 function SectionHeader({ title }) { return <h3 className="text-sm font-semibold tracking-wide text-slate-800">{title}</h3>; }
-function CurrentVideoCard({ videoMeta }) { const tags = safeList(videoMeta?.tags); return <section className="min-w-0 overflow-hidden rounded-2xl bg-slate-900 p-4 text-white shadow-[0_8px_30px_rgb(15,23,42,0.16)]"><div className="mb-2 flex items-center gap-2 text-xs font-semibold text-indigo-200"><Video size={14} />当前视频</div><p className="line-clamp-2 break-words text-sm leading-6 text-white">{videoMeta?.title || "尚未载入游戏视频"}</p><div className="mt-3 flex min-w-0 flex-wrap gap-1.5">{tags.length === 0 && <span className="rounded-full bg-white/10 px-2 py-1 text-xs text-slate-300">等待载入</span>}{tags.map((tag) => <span key={tag} className="max-w-full truncate rounded-full bg-white/10 px-2 py-1 text-xs text-indigo-100">{tag}</span>)}</div></section>; }
+function CurrentVideoCard({ videoMeta }) { const tags = safeList(videoMeta?.tags); const real = videoMeta?.source === "bilibili_api"; return <section className="min-w-0 overflow-hidden rounded-2xl bg-slate-900 p-4 text-white shadow-[0_8px_30px_rgb(15,23,42,0.16)]"><div className="mb-2 flex flex-wrap items-center gap-2 text-xs font-semibold text-indigo-200"><Video size={14} />当前视频{real ? <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[10px] font-semibold text-emerald-200">B站接口真实数据</span> : null}</div><p className="line-clamp-2 break-words text-sm leading-6 text-white">{videoMeta?.title || "尚未载入游戏视频"}</p><div className="mt-3 flex min-w-0 flex-wrap gap-1.5">{tags.length === 0 && <span className="rounded-full bg-white/10 px-2 py-1 text-xs text-slate-300">等待载入</span>}{tags.map((tag) => <span key={tag} className="max-w-full truncate rounded-full bg-white/10 px-2 py-1 text-xs text-indigo-100">{tag}</span>)}</div></section>; }
 function LlmModeSwitch({ config, onChange }) { return <div className="rounded-2xl bg-slate-100 p-1">{[["local", "本地模型"], ["api", "API接口"]].map(([mode, label]) => <button key={mode} type="button" onClick={() => onChange("mode", mode)} className={`rounded-xl px-4 py-2 text-sm font-semibold transition-all duration-300 ${config.mode === mode ? "bg-white text-indigo-600 shadow-sm" : "text-slate-400 hover:text-slate-600"}`}>{label}</button>)}</div>; }
 function LlmInlineSettings({ config, status, loading, onChange, onTest }) { const isLocal = config.mode === "local"; return <div className="mt-5 grid grid-cols-[1fr_160px_1fr_150px] gap-3"><IconInput icon={<Link2 size={15} />} value={isLocal ? config.localBaseUrl : config.apiBaseUrl} onChange={(value) => onChange(isLocal ? "localBaseUrl" : "apiBaseUrl", value)} placeholder={isLocal ? "http://127.0.0.1:11434/v1" : "https://api.openai.com/v1"} /><IconInput icon={<Bot size={15} />} value={config.model} onChange={(value) => onChange("model", value)} placeholder="qwen2.5:7b" /><IconInput type="password" icon={<KeyRound size={15} />} value={config.apiKey} onChange={(value) => onChange("apiKey", value)} placeholder={isLocal ? "本地可留空" : "sk-..."} /><button type="button" onClick={onTest} disabled={loading} className="flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition-all duration-300 hover:-translate-y-0.5 hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-70" title={status.message}>{loading ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}接入</button></div>; }
 function IconInput({ icon, value, onChange, placeholder, type = "text" }) { return <label className="flex min-w-0 items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-slate-400 transition-all duration-300 focus-within:border-indigo-200 focus-within:bg-white">{icon}<input type={type} value={value} onChange={(event) => onChange(event.target.value)} className="min-w-0 flex-1 bg-transparent text-sm text-slate-600 outline-none placeholder:text-slate-400" placeholder={placeholder} /></label>; }

@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 pandas
 python-multipart
+httpx
 
 pydantic

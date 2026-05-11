@@ -2,15 +2,200 @@ import asyncio
 import io
 import json
 import math
+import os
 import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
 import pandas as pd
-from fastapi import Body, FastAPI, File, Form, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+BILIBILI_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com",
+}
+
+
+def extract_bvid(url: str) -> Optional[str]:
+    """Parse BV from URL. Bilibili BV ids are case-sensitive; only normalize the ``BV`` prefix."""
+    if not url:
+        return None
+    match = re.search(r"(?i)bv([a-zA-Z0-9]{10})\b", url)
+    if not match:
+        return None
+    return "BV" + match.group(1)
+
+
+async def resolve_bilibili_page_url(client: httpx.AsyncClient, url: str) -> str:
+    text = (url or "").strip()
+    if not text or extract_bvid(text):
+        return text
+    low = text.lower()
+    if "b23.tv" in low or ("bilibili.com" in low and "bv" not in low):
+        try:
+            response = await client.get(text, follow_redirects=True)
+            return str(response.url)
+        except Exception:
+            return text
+    return text
+
+
+async def fetch_subtitle_text(client: httpx.AsyncClient, subtitle_url: str) -> str:
+    link = subtitle_url.strip()
+    if link.startswith("//"):
+        link = "https:" + link
+    response = await client.get(link, headers=BILIBILI_HEADERS)
+    response.raise_for_status()
+    payload = response.json()
+    lines: List[str] = []
+    for row in payload.get("body") or []:
+        content = row.get("content")
+        if isinstance(content, str) and content.strip():
+            lines.append(content.strip())
+            continue
+        if isinstance(content, list):
+            for piece in content:
+                if isinstance(piece, dict):
+                    seg = piece.get("content")
+                    if isinstance(seg, str) and seg.strip():
+                        lines.append(seg.strip())
+    return "\n".join(lines)
+
+
+async def fetch_bilibili_tags(client: httpx.AsyncClient, aid: int, bvid: str) -> List[str]:
+    try:
+        response = await client.get(
+            "https://api.bilibili.com/x/tag/archive/tags",
+            params={"aid": aid, "bvid": bvid},
+            headers=BILIBILI_HEADERS,
+        )
+        data = response.json()
+        if data.get("code") != 0 or not isinstance(data.get("data"), list):
+            return []
+        names: List[str] = []
+        for item in data["data"]:
+            name = item.get("tag_name") or item.get("name")
+            if name and name not in names:
+                names.append(str(name))
+        return names
+    except Exception:
+        return []
+
+
+async def fetch_bilibili_video_bundle(page_url: str) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=BILIBILI_HEADERS) as client:
+        resolved = await resolve_bilibili_page_url(client, page_url)
+        bvid = extract_bvid(resolved) or extract_bvid(page_url)
+        if not bvid:
+            raise ValueError("未识别到 BV 号。请粘贴完整视频页链接（含 BV…），或先打开 b23.tv 短链再复制最终地址。")
+
+        view_response = await client.get("https://api.bilibili.com/x/web-interface/view", params={"bvid": bvid})
+        view_response.raise_for_status()
+        view_json = view_response.json()
+        if view_json.get("code") != 0:
+            code = view_json.get("code")
+            msg = view_json.get("message") or ""
+            if code == -404:
+                raise ValueError(
+                    f"未找到该视频（BV={bvid}）。若链接正确，请检查 BV 是否被改过大写/小写（B 站 BV 区分大小写）；或视频已删除/不可见。"
+                )
+            raise ValueError(msg or f"B站接口返回 code={code}")
+
+        data = view_json.get("data") or {}
+        aid = int(data.get("aid") or 0)
+        title = (data.get("title") or "").strip()
+        desc = (data.get("desc") or "").strip()
+        stat = data.get("stat") or {}
+        cid = data.get("cid")
+        pages = data.get("pages") or []
+        if pages and isinstance(pages, list):
+            cid = pages[0].get("cid") or cid
+        duration_sec = data.get("duration")
+        tname = (data.get("tname") or "").strip() or "未知分区"
+        tid = data.get("tid")
+
+        tags = await fetch_bilibili_tags(client, aid, bvid) if aid else []
+        if not tags:
+            tags = [tname, "B站"]
+
+        transcript_chunks: List[str] = []
+        subtitle_meta: List[Dict[str, Any]] = []
+
+        if aid and cid:
+            try:
+                player_response = await client.get(
+                    "https://api.bilibili.com/x/player/v2",
+                    params={"aid": aid, "cid": cid, "bvid": bvid},
+                    headers=BILIBILI_HEADERS,
+                )
+                player_json = player_response.json()
+                sub_root = (player_json.get("data") or {}).get("subtitle") or {}
+                tracks = sub_root.get("subtitles") or []
+
+                def track_priority(track: Dict[str, Any]) -> int:
+                    lan = (track.get("lan") or "").lower()
+                    doc = track.get("lan_doc") or ""
+                    if "ai-" in lan or "自动生成" in doc:
+                        return 2
+                    if "zh" in lan or "中文" in doc or "汉语" in doc or "简体" in doc:
+                        return 0
+                    return 1
+
+                for track in sorted(tracks, key=track_priority):
+                    surl = track.get("subtitle_url") or track.get("url")
+                    if not surl:
+                        continue
+                    try:
+                        text = await fetch_subtitle_text(client, surl)
+                    except Exception:
+                        continue
+                    if text.strip():
+                        transcript_chunks.append(text.strip())
+                        subtitle_meta.append(
+                            {
+                                "lang": track.get("lan_doc") or track.get("lan") or "",
+                                "chars": len(text),
+                            }
+                        )
+                        break
+            except Exception:
+                pass
+
+        transcript = "\n".join(transcript_chunks).strip()
+        if not transcript:
+            transcript = (f"【官方简介】\n{desc}" if desc else f"【标题】\n{title}").strip()
+
+        max_chars = 22000
+        if len(transcript) > max_chars:
+            transcript = transcript[:max_chars] + "\n…(内容过长已截断，分析基于前段文本)"
+
+        scenario_type = "GAME" if (tid == 4 or "游戏" in tname) else tname[:24]
+
+        return {
+            "title": title or bvid,
+            "tags": tags[:20],
+            "mock_subtitle": transcript,
+            "scenario_type": scenario_type,
+            "url": page_url.strip(),
+            "bvid": bvid,
+            "source": "bilibili_api",
+            "description": desc[:4000] if desc else "",
+            "bilibili_stat": {
+                "view": stat.get("view"),
+                "like": stat.get("like"),
+                "reply": stat.get("reply"),
+                "danmaku": stat.get("danmaku"),
+                "favorite": stat.get("favorite"),
+                "coin": stat.get("coin"),
+            },
+            "subtitle_tracks": subtitle_meta,
+            "duration_sec": duration_sec,
+            "partition_name": tname,
+        }
 
 
 class VideoRequest(BaseModel):
@@ -206,12 +391,20 @@ async def video_analysis_agent(session: Dict[str, Any]) -> Dict[str, Any]:
     content_score = round((hook_score + clarity_score + rhythm_score) / 3, 1)
     virality_score = round(content_score * 0.62 + min(len(subtitle) / 12, 30), 1)
 
+    insights = [
+        f"Hook得分 {hook_score}，主题清晰度 {clarity_score}，节奏得分 {rhythm_score}。",
+        f"内容综合分 {content_score}，传播潜力分 {virality_score}。",
+    ]
+    if video.get("source") == "bilibili_api":
+        st = video.get("bilibili_stat") or {}
+        insights.append(
+            f"真实抓取：B站公开数据 播放 {st.get('view', '—')}，点赞 {st.get('like', '—')}，评论 {st.get('reply', '—')}，弹幕 {st.get('danmaku', '—')}。"
+        )
+        insights.append(f"文本来源：{'字幕转写' if video.get('subtitle_tracks') else '简介/标题'}（长度 {len(subtitle)} 字），用于语义与结构启发式分析。")
+
     return agent_payload(
         "VideoAnalysisAgent已完成视频结构分析。",
-        [
-            f"Hook得分 {hook_score}，主题清晰度 {clarity_score}，节奏得分 {rhythm_score}。",
-            f"内容综合分 {content_score}，传播潜力分 {virality_score}。",
-        ],
+        insights,
         [
             {"factor": "前三秒问题式Hook", "impact_weight": hook_score / 100, "confidence": 0.86},
             {"factor": "主题标签清晰度", "impact_weight": clarity_score / 100, "confidence": 0.8},
@@ -346,8 +539,19 @@ async def strategy_agent(
 ) -> Dict[str, Any]:
     await asyncio.sleep(0)
     video = (video_result.get("video") or {})
-    is_gacha = any(tag in video.get("tags", []) for tag in ["抽卡建议", "版本前瞻", "角色测评"])
-    title = "新版本抽卡到底值不值？三类玩家直接照着选" if is_gacha else "这个Boss别再硬莽了：三分钟拆清无伤节奏"
+    base = (video.get("title") or "").strip()
+    raw_tags = video.get("tags") or []
+    tag_list = raw_tags if isinstance(raw_tags, list) else []
+    tag_text = " ".join(str(t) for t in tag_list)
+    is_gacha = any(tag in tag_list for tag in ["抽卡建议", "版本前瞻", "角色测评", "抽卡", "卡池", "池子"]) or any(
+        k in (base + tag_text) for k in ("抽卡", "卡池", "池子", "氪金", "保底")
+    )
+    if video.get("source") == "bilibili_api" and base:
+        title = (
+            f"{base[:28]}…到底值不值抽？三类玩家对照选" if is_gacha else f"{base[:28]}…核心要点与节奏：3 分钟讲清"
+        )
+    else:
+        title = "新版本抽卡到底值不值？三类玩家直接照着选" if is_gacha else "这个Boss别再硬莽了：三分钟拆清无伤节奏"
     strategies = [
         f"标题：{title}",
         "发布时间：优先测试 12:00 或 20:30，覆盖午休刷视频和晚间游戏活跃窗口。",
@@ -373,13 +577,31 @@ async def report_agent(all_results: Dict[str, Any]) -> Dict[str, Any]:
     semantic_tags = (all_results.get("knowledge") or {}).get("semantic_tags", [])
     causal = strategy.get("causal_factors", [])
 
+    source = video.get("source") or "heuristic_demo"
+    source_note = (
+        f"数据来源：B站公开接口（BV {video.get('bvid', '')}），字幕/简介已抓取用于分析。"
+        if source == "bilibili_api"
+        else "数据来源：演示场景或未识别 BV 的启发式模板。"
+    )
+    st = video.get("bilibili_stat") or {}
+    stat_line = ""
+    if st:
+        stat_line = f"B站公开互动：播放 {st.get('view', '—')}｜点赞 {st.get('like', '—')}｜评论 {st.get('reply', '—')}｜弹幕 {st.get('danmaku', '—')}｜收藏 {st.get('favorite', '—')}"
+    transcript = (video.get("mock_subtitle") or "").strip()
+    excerpt = (transcript[:1200] + "…") if len(transcript) > 1200 else transcript
+
     report = f"""
 ## AI自媒体内容增长策略报告
 
 ### 1. 内容对象
 视频标题：{video.get("title", "未输入视频")}
-内容分区：B站游戏区 / {video.get("scenario_type", "GAME")}
-核心标签：{"、".join(video.get("tags", []))}
+内容分区：{video.get("partition_name") or "B站"} / {video.get("scenario_type", "GAME")}
+核心标签：{"、".join(video.get("tags", []) if isinstance(video.get("tags"), list) else [])}
+{source_note}
+{stat_line}
+
+### 1.1 视频文本摘录（字幕或简介，供人工核对）
+{excerpt or "（无可用文本）"}
 
 ### 2. 数据与内容诊断
 {all_results.get("data", {}).get("summary", "")}
@@ -402,6 +624,9 @@ async def report_agent(all_results: Dict[str, Any]) -> Dict[str, Any]:
     summary = {
         "video_title": video.get("title", ""),
         "scenario": video.get("scenario_type", "A"),
+        "video_source": video.get("source"),
+        "bvid": video.get("bvid"),
+        "bilibili_stat": video.get("bilibili_stat"),
         "key_metrics": {
             "content_score": all_results.get("video", {}).get("content_score", 0),
             "virality_score": all_results.get("video", {}).get("virality_score", 0),
@@ -416,6 +641,55 @@ async def report_agent(all_results: Dict[str, Any]) -> Dict[str, Any]:
     if len(chat_context_summary) > 2800:
         chat_context_summary = chat_context_summary[:2800]
     return {"report": report, "chat_context_summary": chat_context_summary}
+
+
+async def maybe_llm_markdown_report(all_results: Dict[str, Any]) -> Optional[str]:
+    api_key = os.environ.get("ANALYSIS_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    base_url = (os.environ.get("ANALYSIS_LLM_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    model = os.environ.get("ANALYSIS_LLM_MODEL", "gpt-4o-mini")
+    video = (all_results.get("video") or {}).get("video", {})
+    transcript = (video.get("mock_subtitle") or "")[:14000]
+    signals = {
+        "data": {"summary": (all_results.get("data") or {}).get("summary"), "metrics": (all_results.get("data") or {}).get("metrics")},
+        "video": {
+            "summary": (all_results.get("video") or {}).get("summary"),
+            "content_score": (all_results.get("video") or {}).get("content_score"),
+            "virality_score": (all_results.get("video") or {}).get("virality_score"),
+        },
+        "analysis": {"insights": (all_results.get("analysis") or {}).get("insights")},
+        "counterfactual": (all_results.get("counterfactual") or {}).get("counterfactuals", [])[:3],
+        "knowledge": (all_results.get("knowledge") or {}).get("semantic_tags", [])[:5],
+        "strategy": (all_results.get("strategy") or {}).get("execution_plan", [])[:6],
+    }
+    compact = json.dumps(signals, ensure_ascii=False)[:8000]
+    system = (
+        "你是资深中文 B 站内容与增长顾问。你将获得真实视频的字幕或简介文本，以及一组启发式智能体输出的结构化信号。"
+        "请综合二者输出 Markdown 报告，必须包含章节：## 内容对象、## 数据与内容诊断、## 因果归因、## 反事实推演、## 弹幕语义、## 可执行增长策略。"
+        "必须紧扣字幕/简介中的具体话题与表述；禁止编造字幕中未出现的事实；不确定处请写「需结合画面补充」。"
+    )
+    user = f"【视频标题】{video.get('title', '')}\n【BV】{video.get('bvid', '')}\n【字幕或简介】\n{transcript}\n\n【结构化信号 JSON】\n{compact}"
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "temperature": 0.45,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content")
+        return content.strip() if isinstance(content, str) and content.strip() else None
+    except Exception:
+        return None
 
 
 def local_chat_answer(context: str, question: str) -> str:
@@ -440,6 +714,14 @@ def local_chat_answer(context: str, question: str) -> str:
     if any(key in q for key in ["弹幕", "语义", "黑话"]):
         desc = "；".join([f"{t.get('term')}({t.get('sentiment')})" for t in tags])
         return f"语义增强命中：{desc or '暂无强命中'}。建议把这些表达放在互动提问节点里，提升社区共鸣。"
+    if any(key in q for key in ["播放", "观看", "点赞", "数据", "统计"]):
+        st = ctx.get("bilibili_stat") or {}
+        if st:
+            return (
+                f"B站公开接口抓取的统计：播放 {st.get('view', '—')}，点赞 {st.get('like', '—')}，评论 {st.get('reply', '—')}，"
+                f"弹幕 {st.get('danmaku', '—')}，收藏 {st.get('favorite', '—')}。数值以官方页面为准。"
+            )
+        return "当前摘要里没有该视频的 B 站实时统计；请使用含 BV 的链接载入视频并成功生成报告后再问。"
     if any(key in q for key in ["提升", "策略", "怎么做"]):
         return "执行优先级：先改标题和开场Hook，再测试发布时间，最后在30%和65%进度加入弹幕互动节点。这三项成本低、可用控制变量法验证。"
     cf = counterfactuals[0] if counterfactuals else {}
@@ -475,31 +757,49 @@ def create_app() -> FastAPI:
             session = get_session(request.app.state.memory_db, session_id)
             session["csv_data"] = df.head(500).to_dict(orient="records")
             session["csv_stats"] = stats
-            return {"video_count": stats["video_count"], "avg_views": stats["avg_views"], "status": "success"}
+            return {
+                "video_count": stats["video_count"],
+                "avg_views": stats["avg_views"],
+                "like_rate": stats.get("like_rate", 0),
+                "comment_rate": stats.get("comment_rate", 0),
+                "status": "success",
+            }
         except Exception as exc:
             return {"video_count": 0, "avg_views": 0, "status": "fallback", "message": f"CSV解析失败：{str(exc)[:120]}"}
 
     @app.post("/video")
     async def video(request: Request, payload: VideoRequest) -> Dict[str, Any]:
+        session = get_session(request.app.state.memory_db, payload.session_id)
         try:
-            selected = choose_scenario(payload.url, payload.scenario)
-            selected["url"] = payload.url
-            session = get_session(request.app.state.memory_db, payload.session_id)
+            if payload.scenario in scenarios():
+                selected = dict(choose_scenario(payload.url, payload.scenario))
+                selected["url"] = (payload.url or "").strip()
+                selected.setdefault("source", "demo_scenario")
+            elif extract_bvid((payload.url or "").strip()):
+                selected = await fetch_bilibili_video_bundle((payload.url or "").strip())
+            else:
+                selected = dict(choose_scenario(payload.url, None))
+                selected["url"] = (payload.url or "").strip()
+                selected.setdefault("source", "heuristic_demo")
             session["video_data"] = selected
             return {
-                "title": selected["title"],
-                "tags": selected["tags"],
-                "mock_subtitle": selected["mock_subtitle"],
-                "scenario_type": selected["scenario_type"],
+                "title": selected.get("title", ""),
+                "tags": selected.get("tags", []),
+                "mock_subtitle": selected.get("mock_subtitle", ""),
+                "scenario_type": selected.get("scenario_type", "GAME"),
+                "source": selected.get("source", "unknown"),
+                "bvid": selected.get("bvid"),
+                "description": selected.get("description", ""),
+                "bilibili_stat": selected.get("bilibili_stat"),
+                "subtitle_tracks": selected.get("subtitle_tracks"),
+                "partition_name": selected.get("partition_name"),
             }
-        except Exception:
-            fallback = choose_scenario()
-            return {
-                "title": fallback["title"],
-                "tags": fallback["tags"],
-                "mock_subtitle": fallback["mock_subtitle"],
-                "scenario_type": fallback["scenario_type"],
-            }
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"网络请求失败：{str(exc)[:160]}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"载入视频失败：{str(exc)[:200]}") from exc
 
     @app.post("/analyze")
     async def analyze(request: Request, payload: AnalyzeRequest = Body(...)) -> Dict[str, Any]:
@@ -533,9 +833,16 @@ def create_app() -> FastAPI:
                 "strategy": strategy,
             }
             report = await with_timeout("ReportAgent", report_agent(all_results), {"report": "报告生成降级，请稍后重试。", "chat_context_summary": "{}"})
+            llm_report: Optional[str] = None
+            try:
+                llm_report = await asyncio.wait_for(maybe_llm_markdown_report(all_results), timeout=95.0)
+            except (asyncio.TimeoutError, Exception):
+                llm_report = None
+            if llm_report:
+                report = {**report, "report": llm_report}
             session["analysis_result"] = all_results
             session["chat_context_summary"] = report.get("chat_context_summary", "{}")
-            return {"report": report.get("report", ""), "data": all_results}
+            return {"report": report.get("report", ""), "data": all_results, "report_llm": bool(llm_report)}
         except Exception as exc:
             return {
                 "report": f"系统已触发稳定性兜底：{str(exc)[:120]}。请继续演示，默认策略为优化标题、发布时间与互动节点。",

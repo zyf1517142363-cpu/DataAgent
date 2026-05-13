@@ -19,6 +19,171 @@ BILIBILI_HEADERS = {
     "Referer": "https://www.bilibili.com",
 }
 
+APP_DATA_ROOT = Path(__file__).resolve().parent / "app-data" / "workspaces"
+
+
+def safe_scope_id(value: str, default: str = "default_workspace") -> str:
+    raw = (value or "").strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "_", raw)
+    cleaned = cleaned[:80].strip("_")
+    return cleaned or default
+
+
+def workspace_dir(workspace_id: str) -> Path:
+    return APP_DATA_ROOT / safe_scope_id(workspace_id)
+
+
+def workspace_file(workspace_id: str) -> Path:
+    return workspace_dir(workspace_id) / "workspace.json"
+
+
+def sessions_dir(workspace_id: str) -> Path:
+    return workspace_dir(workspace_id) / "sessions"
+
+
+def session_file(workspace_id: str, session_id: str) -> Path:
+    return sessions_dir(workspace_id) / f"{safe_scope_id(session_id, 'default_session')}.json"
+
+
+def ensure_workspace_storage(workspace_id: str) -> None:
+    root = workspace_dir(workspace_id)
+    (root / "sessions").mkdir(parents=True, exist_ok=True)
+    (root / "memory").mkdir(parents=True, exist_ok=True)
+    (root / "vector_store").mkdir(parents=True, exist_ok=True)
+    (root / "embeddings").mkdir(parents=True, exist_ok=True)
+    (root / "rag_cache").mkdir(parents=True, exist_ok=True)
+    (root / "indexes").mkdir(parents=True, exist_ok=True)
+
+
+def save_workspace_meta(workspace_id: str) -> None:
+    ensure_workspace_storage(workspace_id)
+    wid = safe_scope_id(workspace_id)
+    payload = {
+        "id": wid,
+        "name": wid,
+        "memoryScopeId": f"memory_{wid}",
+        "updatedAt": pd.Timestamp.utcnow().isoformat(),
+    }
+    workspace_file(workspace_id).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_workspace_meta_payload(workspace_id: str, payload: Dict[str, Any]) -> None:
+    ensure_workspace_storage(workspace_id)
+    data = {
+        "id": safe_scope_id(workspace_id),
+        "name": payload.get("name") or safe_scope_id(workspace_id),
+        "folderPath": payload.get("folderPath") or payload.get("folder_path") or "",
+        "memoryScopeId": payload.get("memoryScopeId") or f"memory_{safe_scope_id(workspace_id)}",
+        "updatedAt": payload.get("updatedAt") or pd.Timestamp.utcnow().isoformat(),
+        "indexedFiles": payload.get("indexedFiles") or payload.get("indexed_files") or [],
+    }
+    workspace_file(workspace_id).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_workspace_meta(workspace_id: str) -> Dict[str, Any]:
+    path = workspace_file(workspace_id)
+    if not path.exists():
+        return {
+            "id": safe_scope_id(workspace_id),
+            "name": safe_scope_id(workspace_id),
+            "folderPath": "",
+            "memoryScopeId": f"memory_{safe_scope_id(workspace_id)}",
+            "updatedAt": pd.Timestamp.utcnow().isoformat(),
+            "indexedFiles": [],
+        }
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload.setdefault("id", safe_scope_id(workspace_id))
+            payload.setdefault("name", safe_scope_id(workspace_id))
+            payload.setdefault("folderPath", "")
+            payload.setdefault("memoryScopeId", f"memory_{safe_scope_id(workspace_id)}")
+            payload.setdefault("indexedFiles", [])
+            return payload
+    except Exception:
+        pass
+    return {
+        "id": safe_scope_id(workspace_id),
+        "name": safe_scope_id(workspace_id),
+        "folderPath": "",
+        "memoryScopeId": f"memory_{safe_scope_id(workspace_id)}",
+        "updatedAt": pd.Timestamp.utcnow().isoformat(),
+        "indexedFiles": [],
+    }
+
+
+def list_sessions_from_disk(workspace_id: str) -> List[Dict[str, Any]]:
+    root = sessions_dir(workspace_id)
+    if not root.exists():
+        return []
+    items: List[Dict[str, Any]] = []
+    for file in sorted(root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            payload = json.loads(file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        meta = payload.get("_meta") or {}
+        items.append(
+            {
+                "id": meta.get("session_id") or file.stem,
+                "title": payload.get("title") or f"会话 {file.stem[:8]}",
+                "updatedAt": meta.get("updated_at") or pd.Timestamp.utcfromtimestamp(file.stat().st_mtime).isoformat(),
+                "summary": payload.get("summary") or "",
+            }
+        )
+    return items
+
+
+def list_workspaces_from_disk() -> List[Dict[str, Any]]:
+    if not APP_DATA_ROOT.exists():
+        return []
+    result: List[Dict[str, Any]] = []
+    for path in sorted(APP_DATA_ROOT.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not path.is_dir():
+            continue
+        wid = path.name
+        meta = read_workspace_meta(wid)
+        sessions = list_sessions_from_disk(wid)
+        result.append(
+            {
+                "id": wid,
+                "name": meta.get("name") or wid,
+                "folderPath": meta.get("folderPath") or "",
+                "memoryScopeId": meta.get("memoryScopeId") or f"memory_{wid}",
+                "updatedAt": meta.get("updatedAt") or pd.Timestamp.utcnow().isoformat(),
+                "indexedFiles": meta.get("indexedFiles") or [],
+                "sessions": sessions,
+                "activeSessionId": sessions[0]["id"] if sessions else None,
+            }
+        )
+    return result
+
+
+def read_session_from_disk(workspace_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+    path = session_file(workspace_id, session_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def save_session_to_disk(workspace_id: str, session_id: str, session: Dict[str, Any]) -> None:
+    ensure_workspace_storage(workspace_id)
+    save_workspace_meta(workspace_id)
+    path = session_file(workspace_id, session_id)
+    payload = dict(session)
+    payload["_meta"] = {
+        "workspace_id": safe_scope_id(workspace_id),
+        "session_id": safe_scope_id(session_id, "default_session"),
+        "updated_at": pd.Timestamp.utcnow().isoformat(),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def extract_bvid(url: str) -> Optional[str]:
     """Parse BV from URL. Bilibili BV ids are case-sensitive; only normalize the ``BV`` prefix."""
@@ -199,18 +364,45 @@ async def fetch_bilibili_video_bundle(page_url: str) -> Dict[str, Any]:
 
 
 class VideoRequest(BaseModel):
+    workspace_id: Optional[str] = "default_workspace"
     session_id: str
     url: str = ""
     scenario: Optional[str] = None
 
 
 class AnalyzeRequest(BaseModel):
+    workspace_id: Optional[str] = "default_workspace"
     session_id: str
 
 
 class ChatRequest(BaseModel):
+    workspace_id: Optional[str] = "default_workspace"
     session_id: str
     question: str
+
+
+class WorkspaceImportRequest(BaseModel):
+    workspace_id: str
+    name: Optional[str] = None
+    folder_path: Optional[str] = None
+    indexed_files: Optional[List[Dict[str, Any]]] = None
+
+
+class SessionCreateRequest(BaseModel):
+    workspace_id: str
+    session_id: Optional[str] = None
+    title: Optional[str] = "New Chat"
+
+
+class SessionRenameRequest(BaseModel):
+    workspace_id: str
+    session_id: str
+    title: str
+
+
+class SessionDeleteRequest(BaseModel):
+    workspace_id: str
+    session_id: str
 
 
 def agent_payload(
@@ -240,11 +432,29 @@ def create_initial_session() -> Dict[str, Any]:
     }
 
 
-def get_session(memory_db: Dict[str, Any], session_id: str) -> Dict[str, Any]:
-    safe_session_id = session_id or str(uuid.uuid4())
-    if safe_session_id not in memory_db:
-        memory_db[safe_session_id] = create_initial_session()
-    return memory_db[safe_session_id]
+def get_session(memory_db: Dict[str, Any], workspace_id: str, session_id: str) -> Dict[str, Any]:
+    safe_workspace_id = safe_scope_id(workspace_id)
+    safe_session_id = safe_scope_id(session_id, str(uuid.uuid4()))
+    if safe_workspace_id not in memory_db:
+        memory_db[safe_workspace_id] = {}
+    workspace_sessions = memory_db[safe_workspace_id]
+    if safe_session_id in workspace_sessions:
+        return workspace_sessions[safe_session_id]
+    loaded = read_session_from_disk(safe_workspace_id, safe_session_id)
+    if loaded is None:
+        loaded = create_initial_session()
+    workspace_sessions[safe_session_id] = loaded
+    save_session_to_disk(safe_workspace_id, safe_session_id, loaded)
+    return loaded
+
+
+def persist_session(memory_db: Dict[str, Any], workspace_id: str, session_id: str) -> None:
+    safe_workspace_id = safe_scope_id(workspace_id)
+    safe_session_id = safe_scope_id(session_id, "default_session")
+    workspace_sessions = memory_db.get(safe_workspace_id) or {}
+    if safe_session_id not in workspace_sessions:
+        return
+    save_session_to_disk(safe_workspace_id, safe_session_id, workspace_sessions[safe_session_id])
 
 
 def scenarios() -> Dict[str, Dict[str, Any]]:
@@ -742,11 +952,93 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
-        return {"status": "ok", "sessions": len(app.state.memory_db)}
+        workspace_count = len(app.state.memory_db)
+        session_count = sum(len(v or {}) for v in app.state.memory_db.values())
+        return {"status": "ok", "workspaces": workspace_count, "sessions": session_count}
+
+    @app.get("/workspace/list")
+    async def workspace_list() -> Dict[str, Any]:
+        return {"workspaces": list_workspaces_from_disk()}
+
+    @app.post("/workspace/import")
+    async def workspace_import(payload: WorkspaceImportRequest) -> Dict[str, Any]:
+        wid = safe_scope_id(payload.workspace_id)
+        ensure_workspace_storage(wid)
+        save_workspace_meta_payload(
+            wid,
+            {
+                "name": payload.name or wid,
+                "folderPath": payload.folder_path or "",
+                "memoryScopeId": f"memory_{wid}",
+                "indexedFiles": payload.indexed_files or [],
+                "updatedAt": pd.Timestamp.utcnow().isoformat(),
+            },
+        )
+        sessions = list_sessions_from_disk(wid)
+        if not sessions:
+            sid = safe_scope_id(str(uuid.uuid4()), "default_session")
+            session = create_initial_session()
+            session["title"] = "New Chat"
+            session["summary"] = "新会话"
+            save_session_to_disk(wid, sid, session)
+            sessions = list_sessions_from_disk(wid)
+        meta = read_workspace_meta(wid)
+        return {
+            "workspace": {
+                "id": wid,
+                "name": meta.get("name") or wid,
+                "folderPath": meta.get("folderPath") or "",
+                "memoryScopeId": meta.get("memoryScopeId") or f"memory_{wid}",
+                "updatedAt": meta.get("updatedAt"),
+                "indexedFiles": meta.get("indexedFiles") or [],
+                "sessions": sessions,
+                "activeSessionId": sessions[0]["id"] if sessions else None,
+            }
+        }
+
+    @app.get("/workspace/{workspace_id}/sessions")
+    async def workspace_sessions(workspace_id: str) -> Dict[str, Any]:
+        wid = safe_scope_id(workspace_id)
+        return {"workspace_id": wid, "sessions": list_sessions_from_disk(wid)}
+
+    @app.post("/session/create")
+    async def session_create(request: Request, payload: SessionCreateRequest) -> Dict[str, Any]:
+        wid = safe_scope_id(payload.workspace_id)
+        sid = safe_scope_id(payload.session_id or str(uuid.uuid4()), "default_session")
+        title = (payload.title or "New Chat").strip() or "New Chat"
+        session = get_session(request.app.state.memory_db, wid, sid)
+        session["title"] = title
+        session["summary"] = session.get("summary") or "新会话"
+        persist_session(request.app.state.memory_db, wid, sid)
+        return {"session": {"id": sid, "title": title, "updatedAt": pd.Timestamp.utcnow().isoformat(), "summary": session.get("summary", "")}}
+
+    @app.post("/session/rename")
+    async def session_rename(request: Request, payload: SessionRenameRequest) -> Dict[str, Any]:
+        wid = safe_scope_id(payload.workspace_id)
+        sid = safe_scope_id(payload.session_id, "default_session")
+        title = (payload.title or "").strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title 不能为空")
+        session = get_session(request.app.state.memory_db, wid, sid)
+        session["title"] = title
+        persist_session(request.app.state.memory_db, wid, sid)
+        return {"ok": True, "session": {"id": sid, "title": title, "updatedAt": pd.Timestamp.utcnow().isoformat()}}
+
+    @app.post("/session/delete")
+    async def session_delete(request: Request, payload: SessionDeleteRequest) -> Dict[str, Any]:
+        wid = safe_scope_id(payload.workspace_id)
+        sid = safe_scope_id(payload.session_id, "default_session")
+        file = session_file(wid, sid)
+        if file.exists():
+            file.unlink()
+        if wid in request.app.state.memory_db and sid in request.app.state.memory_db[wid]:
+            del request.app.state.memory_db[wid][sid]
+        return {"ok": True, "workspace_id": wid, "session_id": sid}
 
     @app.post("/upload")
     async def upload_csv(
         request: Request,
+        workspace_id: str = Form("default_workspace"),
         session_id: str = Form(...),
         file: UploadFile = File(...),
     ) -> Dict[str, Any]:
@@ -754,9 +1046,10 @@ def create_app() -> FastAPI:
             content = await file.read()
             df = pd.read_csv(io.BytesIO(content))
             stats = compute_csv_stats(df)
-            session = get_session(request.app.state.memory_db, session_id)
+            session = get_session(request.app.state.memory_db, workspace_id, session_id)
             session["csv_data"] = df.head(500).to_dict(orient="records")
             session["csv_stats"] = stats
+            persist_session(request.app.state.memory_db, workspace_id, session_id)
             return {
                 "video_count": stats["video_count"],
                 "avg_views": stats["avg_views"],
@@ -769,7 +1062,8 @@ def create_app() -> FastAPI:
 
     @app.post("/video")
     async def video(request: Request, payload: VideoRequest) -> Dict[str, Any]:
-        session = get_session(request.app.state.memory_db, payload.session_id)
+        workspace_id = payload.workspace_id or "default_workspace"
+        session = get_session(request.app.state.memory_db, workspace_id, payload.session_id)
         try:
             if payload.scenario in scenarios():
                 selected = dict(choose_scenario(payload.url, payload.scenario))
@@ -782,6 +1076,7 @@ def create_app() -> FastAPI:
                 selected["url"] = (payload.url or "").strip()
                 selected.setdefault("source", "heuristic_demo")
             session["video_data"] = selected
+            persist_session(request.app.state.memory_db, workspace_id, payload.session_id)
             return {
                 "title": selected.get("title", ""),
                 "tags": selected.get("tags", []),
@@ -803,7 +1098,8 @@ def create_app() -> FastAPI:
 
     @app.post("/analyze")
     async def analyze(request: Request, payload: AnalyzeRequest = Body(...)) -> Dict[str, Any]:
-        session = get_session(request.app.state.memory_db, payload.session_id)
+        workspace_id = payload.workspace_id or "default_workspace"
+        session = get_session(request.app.state.memory_db, workspace_id, payload.session_id)
         try:
             data_fallback = agent_payload("DataAgent降级：使用空数据基线。", metrics={"video_count": 0, "avg_views": 0})
             video_fallback = agent_payload("VideoAnalysisAgent降级：使用默认科技Mock。", video=choose_scenario(), content_score=80, virality_score=78)
@@ -842,6 +1138,7 @@ def create_app() -> FastAPI:
                 report = {**report, "report": llm_report}
             session["analysis_result"] = all_results
             session["chat_context_summary"] = report.get("chat_context_summary", "{}")
+            persist_session(request.app.state.memory_db, workspace_id, payload.session_id)
             return {"report": report.get("report", ""), "data": all_results, "report_llm": bool(llm_report)}
         except Exception as exc:
             return {
@@ -852,10 +1149,12 @@ def create_app() -> FastAPI:
     @app.post("/chat")
     async def chat(request: Request, payload: ChatRequest) -> Dict[str, Any]:
         try:
-            session = get_session(request.app.state.memory_db, payload.session_id)
+            workspace_id = payload.workspace_id or "default_workspace"
+            session = get_session(request.app.state.memory_db, workspace_id, payload.session_id)
             context = session.get("chat_context_summary", "")[:3000]
             prompt = f"基于以下项目分析摘要回答问题：{context}。用户问题：{payload.question}"
             answer = local_chat_answer(context, payload.question)
+            persist_session(request.app.state.memory_db, workspace_id, payload.session_id)
             return {"answer": answer, "prompt_tokens_guard": len(prompt)}
         except Exception:
             return {"answer": "当前会话上下文不可用。请先上传CSV或输入视频URL并点击生成分析报告。"}
